@@ -328,7 +328,7 @@ class UniterModel(UniterPreTrainedModel):
             img_feat, img_pos_feat, img_masks, img_type_ids)
         # align back to most compact input
         gather_index = gather_index.unsqueeze(-1).expand(
-            -1, -1, self.config.hidden_size)
+            -1, -1, self.config.hidden_size).to(txt_emb.device)
         embedding_output = torch.gather(torch.cat([txt_emb, img_emb], dim=1),
                                         dim=1, index=gather_index)
         return embedding_output

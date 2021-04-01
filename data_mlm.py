@@ -40,7 +40,6 @@ def create_dataloaders(imgdbpath, datasets, is_train, opts, all_img_dbs=None):
             else:
                 raise ValueError(f'Undefined task {task}')
 
-            #LOGGER.info(f"{len(dataset[0])*hvd.size()} samples loaded")
             LOGGER.info(f"{len(dataset[0])} samples loaded")
             loader = build_dataloader(*dataset, is_train, opts)
             if is_train:

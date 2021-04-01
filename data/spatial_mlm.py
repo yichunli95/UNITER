@@ -83,43 +83,45 @@ def random_word(example, vocab_range, mask):
 
     # print(f'len(input_ids) is {len(input_ids)}')
     # print(f'len(output_label) is {len(output_label)}')
+    # input_ids, txt_labels
     return input_ids, output_label
 
 def random_replace(num_token, prob, token_list, i, mask, vocab_range, output_label, input_ids):
     #print(token_list)
     #print(token_list[i])
     # mask token with 15% probability
-    if prob < 0.15:
-        prob /= 0.15
+    # if prob < 0.15:
+    #     prob /= 0.15
 
         # 80% randomly change token to mask token
-        if prob < 0.8:
-            for ct in range(i, i + num_token):
-                wd = tokenizer1.tokenize(token_list[ct])
-                tid = tokenizer1.convert_tokens_to_ids(wd)
-                if len(tid) == 1:
-                    token_list[ct] = '[MASK]'
-                    output_label.append(mask)
-                else:
-                    output_label.extend(tid)
-                input_ids.extend(tid)
+        #if prob < 0.8:
+    for ct in range(i, i + num_token):
+        wd = tokenizer1.tokenize(token_list[ct])
+        tid = tokenizer1.convert_tokens_to_ids(wd)
+        if len(tid) == 1:
+            token_list[ct] = '[MASK]'
+            input_ids.append(mask)
+            output_label.append(tid[0])
+        else:
+            output_label.extend(tid)
+            input_ids.extend(tid)
         # 10% randomly change token to random token
-        elif prob < 0.9:
-            for ct in range(i, i + num_token):
-                tid = random.choice(list(range(*vocab_range)))
-                token_list[ct] = tokenizer1.convert_ids_to_tokens([tid])[0]
-                output_label.append(tid)
-                input_ids.append(tid)
+        # elif prob < 0.9:
+        #     for ct in range(i, i + num_token):
+        #         tid = random.choice(list(range(*vocab_range)))
+        #         token_list[ct] = tokenizer1.convert_ids_to_tokens([tid])[0]
+        #         output_label.append(tid)
+        #         input_ids.append(tid)
         # -> rest 10% randomly keep current token
         # append current token to output (we will predict these later)
-    else:
-        #print('--')
-        for ct in range(i, i + num_token):
-            # no masking token (will be ignored by loss function later)
-            wd = tokenizer1.tokenize(token_list[ct])
-            ids = tokenizer1.convert_tokens_to_ids(wd)
-            output_label.extend([-1]*len(ids))
-            input_ids.extend(ids)
+    # else:
+    #     #print('--')
+    #     for ct in range(i, i + num_token):
+    #         # no masking token (will be ignored by loss function later)
+    #         wd = tokenizer1.tokenize(token_list[ct])
+    #         ids = tokenizer1.convert_tokens_to_ids(wd)
+    #         output_label.extend([-1]*len(ids))
+    #         input_ids.extend(ids)
     return output_label, input_ids
 
 class SpatialMlmDataset(mlm_DetectFeatTxtTokDataset):

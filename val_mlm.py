@@ -7,7 +7,7 @@ from tqdm import tqdm
 import torch
 from os.path import exists, join
 import json
-
+import csv
 from utils.logger import LOGGER, TB_LOGGER, RunningMeter, add_log_to_file
 from utils.misc import NoOp, parse_with_config, set_dropout, set_random_seed
 from utils.save import ModelSaver, save_training_meta
@@ -22,16 +22,16 @@ from torch.nn import functional as F
 from data_mlm import create_dataloaders
 from data import (PrefetchLoader, MetaLoader)
 from model.pretrain import UniterForPretraining
+from pytorch_pretrained_bert import BertTokenizer
 
 def main(opts):
     device = torch.device("cuda")
     set_random_seed(opts.seed)
 
-    all_dbs = [db for datasets in [opts.train_datasets, opts.val_datasets]
-               for dset in datasets for db in dset['db']]
-
     val_dataloaders, _ = create_dataloaders('nlvr2/img_db/nlvr2_dev',
         opts.val_datasets, False, opts)
+    test_dataloaders, _ = create_dataloaders('nlvr2/img_db/nlvr2_test',
+        opts.test_datasets, False, opts)
     # Prepare model
     if opts.checkpoint:
         checkpoint = torch.load(opts.checkpoint)
@@ -48,14 +48,15 @@ def main(opts):
     optimizer = build_optimizer(model, opts)
     optimizer.zero_grad()
     optimizer.step()
-    validate(model, val_dataloaders)
+    validate(model, val_dataloaders, 'val')
+    validate(model, test_dataloaders, 'test')
 
-def validate(model, val_dataloaders):
+def validate(model, dataloaders, setname):
     model.eval()
-    for task, loader in val_dataloaders.items():
+    for task, loader in dataloaders.items():
         LOGGER.info(f"validate on {task} task")
         if task.startswith('mlm'):
-            val_log = validate_mlm(model, loader)
+            val_log = validate_mlm(model, loader, setname)
         else:
             raise ValueError(f'Undefined task {task}')
         val_log = {f'{task}_{k}': v for k, v in val_log.items()}
@@ -64,21 +65,36 @@ def validate(model, val_dataloaders):
     model.train()
 
 @torch.no_grad()
-def validate_mlm(model, val_loader):
+def validate_mlm(model, val_loader, setname):
+    #cpu_device = torch.device("cpu")
     LOGGER.info("start running MLM validation...")
     val_loss = 0
     n_correct = 0
     n_word = 0
     st = time()
-    for i, batch in enumerate(val_loader):
-        #print(f'batch {i}')
-        scores = model(batch, task='mlm', compute_loss=False)
-        labels = batch['txt_labels']
-        labels = labels[labels != -1]
-        loss = F.cross_entropy(scores, labels, reduction='sum')
-        val_loss += loss.item()
-        n_correct += (scores.max(dim=-1)[1] == labels).sum().item()
-        n_word += labels.numel()
+    tokenizer = BertTokenizer.from_pretrained("bert-base-cased", do_lower_case=False)
+    fn = f'mlm_{setname}_predictions.csv'
+    with open(fn, 'w') as f:
+        cw = csv.writer(f)
+        cw.writerow(['actual', 'predict'])
+        #print(len(val_loader))
+        for i, batch in enumerate(val_loader):
+
+            scores = model(batch, task='mlm', compute_loss=False)
+            # What the masked words originally were
+            labels = batch['txt_labels']
+            labels = labels[labels != -1]
+            loss = F.cross_entropy(scores, labels, reduction='sum')
+            val_loss += loss.item()
+            # What the masked words predictions were
+            pred = scores.max(dim=-1)[1]
+            n_correct += (pred == labels).sum().item()
+            n_word += labels.numel()
+            actual_words = tokenizer.convert_ids_to_tokens(labels.tolist())
+            pred_words = tokenizer.convert_ids_to_tokens(pred.tolist())
+            assert len(actual_words) == len(pred_words)
+            for actual, pred in zip(actual_words, pred_words):
+                cw.writerow([actual, pred])
     tot_time = time()-st
     val_loss /= n_word
     acc = n_correct / n_word

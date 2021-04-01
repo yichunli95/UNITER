@@ -59,5 +59,19 @@
                 "mlm"
             ]
         }
+    ],
+    "test_datasets": [
+        {
+            "name": "nlvr2",
+            "db": [
+                "nlvr2/txt_db/nlvr2_test1.db"
+            ],
+            "img": [
+                "nlvr2/img_db/nlvr2_test"
+            ],
+            "tasks": [
+                "mlm"
+            ]
+        }
     ]
 }

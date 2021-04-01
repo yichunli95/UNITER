@@ -234,6 +234,7 @@ class DetectFeatTxtTokDataset(Dataset):
         txt_lens, self.ids = get_ids_and_lens(txt_db)
 
         txt2img = txt_db.txt2img
+        
         self.lens = [tl + self.img_db.name2nbb[txt2img[id_]]
                      for tl, id_ in zip(txt_lens, self.ids)]
 
@@ -251,6 +252,41 @@ class DetectFeatTxtTokDataset(Dataset):
         num_bb = img_feat.size(0)
         return img_feat, img_bb, num_bb
 
+class mlm_DetectFeatTxtTokDataset(Dataset):
+    def __init__(self, txt_db, img_db):
+        assert isinstance(txt_db, TxtTokLmdb)
+        assert isinstance(img_db, DetectFeatLmdb)
+        self.txt_db = txt_db
+        self.img_db = img_db
+        txt_lens, self.ids = self.get_ids_and_lens(txt_db)
+
+        txt2img = txt_db.txt2img
+
+        self.lens = [tl + self.img_db.name2nbb[txt2img[id_][0]] + self.img_db.name2nbb[txt2img[id_][1]]
+                     for tl, id_ in zip(txt_lens, self.ids)]
+
+    def __len__(self):
+        return len(self.ids)
+
+    def __getitem__(self, i):
+        id_ = self.ids[i]
+        example = self.txt_db[id_]
+        return example
+
+    def _get_img_feat(self, fname):
+        img_feat, bb = self.img_db[fname]
+        img_bb = torch.cat([bb, bb[:, 4:5]*bb[:, 5:]], dim=-1)
+        num_bb = img_feat.size(0)
+        return img_feat, img_bb, num_bb
+    
+    def get_ids_and_lens(self, db):
+        assert isinstance(db, TxtTokLmdb)
+        lens = []
+        ids = []
+        for id_ in list(db.id2len.keys()):
+            lens.append(db.id2len[id_])
+            ids.append(id_)
+        return lens, ids
 
 def pad_tensors(tensors, lens=None, pad=0):
     """B x [T, ...]"""
@@ -310,3 +346,4 @@ class ImageLmdbGroup(object):
             img_db = DetectFeatLmdb(path, self.conf_th, self.max_bb,
                                     self.min_bb, self.num_bb, self.compress)
         return img_db
+

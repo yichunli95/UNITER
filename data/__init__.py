@@ -26,3 +26,4 @@ from .vcr import (VcrTxtTokLmdb, VcrDataset, VcrEvalDataset,
                   vcr_collate, vcr_eval_collate)
 from .re import (ReTxtTokLmdb, ReDataset, ReEvalDataset,
                  re_collate, re_eval_collate)
+from .spatial_mlm import SpatialMlmDataset, spatial_mlm_collate

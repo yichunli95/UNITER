@@ -73,8 +73,8 @@ def validate_mlm(model, val_loader, setname):
     n_word = 0
     st = time()
     tokenizer = BertTokenizer.from_pretrained("bert-base-cased", do_lower_case=False)
-    fn = f'mlm_{setname}_predictions.csv'
-    #fn = f'mlm_{setname}_predictions_text_only.csv'
+    # fn = f'/content/mlm_{setname}_predictions.csv'
+    fn = f'/content/mlm_{setname}_predictions_text_only.csv'
     with open(fn, 'w') as f:
         cw = csv.writer(f)
         cw.writerow(['actual', 'predict'])

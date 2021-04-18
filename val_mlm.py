@@ -1,380 +1,196 @@
-"""
-Copyright (c) Microsoft Corporation.
-Licensed under the MIT license.
-
-MLM datasets
-"""
-import random
-
+from collections import defaultdict
+import argparse
+import math
+import os
+from time import time
+from tqdm import tqdm
 import torch
-from torch.nn.utils.rnn import pad_sequence
-from toolz.sandbox import unzip
+from os.path import exists, join
+import json
+import csv
+from utils.logger import LOGGER, TB_LOGGER, RunningMeter, add_log_to_file
+from utils.misc import NoOp, parse_with_config, set_dropout, set_random_seed
+from utils.save import ModelSaver, save_training_meta
+from utils.const import IMG_DIM, IMG_LABEL_DIM, BUCKET_SIZE
+from utils.distributed import (all_reduce_and_rescale_tensors, all_gather_list,
+                               broadcast_tensors)
+from optim.misc import build_optimizer
+from optim import get_lr_sched
+from torch.nn.utils import clip_grad_norm_
+from torch.nn import functional as F
 
-from .data import (mlm_DetectFeatTxtTokDataset, TxtTokLmdb,
-                   pad_tensors, get_gather_index)
+from data_mlm import create_dataloaders
+from data import (PrefetchLoader, MetaLoader)
+from model.pretrain import UniterForPretraining
 from pytorch_pretrained_bert import BertTokenizer
-from cytoolz import curry
-import spacy
-from sprl import * 
-from spacy.tokenizer import Tokenizer
-# import nltk
-# nltk.download('punkt')
-# from nltk.tokenize import word_tokenize
-nlp = spacy.load('/content/UNITER/models/en_core_web_lg-sprl')
-device = torch.device("cuda")
 
+def main(opts):
+    device = torch.device("cuda")
+    set_random_seed(opts.seed)
 
-@curry
-def bert_tokenize(tokenizer, text):
-    ids = []
-    for word in text.strip().split():
-        ws = tokenizer.tokenize(word)
-        if not ws:
-            # some special char
-            continue
-        ids.extend(tokenizer.convert_tokens_to_ids(ws))
-    return ids
+    val_dataloaders, _ = create_dataloaders('nlvr2/img_db/nlvr2_dev',
+        opts.val_datasets, False, opts)
+    test_dataloaders, _ = create_dataloaders('nlvr2/img_db/nlvr2_test',
+        opts.test_datasets, False, opts)
+    # Prepare model
+    if opts.checkpoint:
+        checkpoint = torch.load(opts.checkpoint)
+    else:
+        checkpoint = {}
+    model = UniterForPretraining.from_pretrained(
+        opts.model_config, checkpoint,
+        img_dim=IMG_DIM, img_label_dim=IMG_LABEL_DIM)
+    model.to(device)
+    model.train()
+    set_dropout(model, opts.dropout)
 
-tokenizer1 = BertTokenizer.from_pretrained("bert-base-cased", do_lower_case=False)
-tokenizer2 = bert_tokenize(tokenizer1)
+    # Prepare optimizer
+    optimizer = build_optimizer(model, opts)
+    optimizer.zero_grad()
+    optimizer.step()
+    validate(model, val_dataloaders, 'val')
+    validate(model, test_dataloaders, 'test')
 
-def mask_spatial(example, vocab_range, mask):
-    input_ids = []
-    output_label = []
-    # 1. spacy tokenize the sentence and sprl-spacy find the spatial words
-    old_tokens = nlp(example['sentence'])
-    old_tokens = [t.text for t in old_tokens]
-    relations = sprl(example['sentence'], nlp, model_relext_filename='models/model_svm_relations.pkl')
-
-    # 2. replace the spatial tokens with mask only if bert tokenize it as one word
-    mask_to_old_bert_token = {}
-    for rel in relations:
-        start, end = rel[1].start, rel[1].end
-        all_single = True
-        for i in range(start, end):
-            bert_token = tokenizer1.tokenize(old_tokens[i])
-            tid = tokenizer1.convert_tokens_to_ids(bert_token)
-            if len(tid) == 1:
-                mask_to_old_bert_token[i] = tid[0]
-                #old_tokens[i] = '[MASK]'
-            else:
-                all_single = False
-                break
-        if all_single:
-            for i in range(start, end):
-                old_tokens[i] = '[MASK]'
-
-    # 3. use bert to tokenize and generate input_ids and output_label
-    for i, token in enumerate(old_tokens):
-        if token != '[MASK]':
-            wd = tokenizer1.tokenize(token)
-            ids = tokenizer1.convert_tokens_to_ids(wd)
-            output_label.extend([-1]*len(ids))
-            input_ids.extend(ids)
+def validate(model, dataloaders, setname):
+    model.eval()
+    for task, loader in dataloaders.items():
+        LOGGER.info(f"validate on {task} task")
+        if task.startswith('mlm'):
+            val_log = validate_mlm(model, loader, setname)
         else:
-            input_ids.append(mask)
-            output_label.append(mask_to_old_bert_token[i])
+            raise ValueError(f'Undefined task {task}')
+        val_log = {f'{task}_{k}': v for k, v in val_log.items()}
+        TB_LOGGER.log_scaler_dict(
+            {f'valid_{task}/{k}': v for k, v in val_log.items()})
+    model.train()
 
-    if all(o == -1 for o in output_label):
-        # at least mask 1
-        #output_label[0] = example['input_ids'][0]
-        output_label[0] = tokenizer1.convert_tokens_to_ids(tokenizer1.tokenize('.'))[0]
-        input_ids[0] = mask
-    
-    assert len(input_ids) == len(output_label)
-    return input_ids, output_label
+@torch.no_grad()
+def validate_mlm(model, val_loader, setname):
+    #cpu_device = torch.device("cpu")
+    LOGGER.info("start running MLM validation...")
+    val_loss = 0
+    n_correct = 0
+    n_word = 0
+    st = time()
+    tokenizer = BertTokenizer.from_pretrained("bert-base-cased", do_lower_case=False)
+    fn = f'mlm_{setname}_predictions.csv'
+    #fn = f'mlm_{setname}_predictions_text_only.csv'
+    with open(fn, 'w') as f:
+        cw = csv.writer(f)
+        cw.writerow(['actual', 'predict'])
+        #print(len(val_loader))
+        for i, batch in tqdm(enumerate(val_loader)):
 
+            scores = model(batch, task='mlm', compute_loss=False)
+            # What the masked words originally were
+            labels = batch['txt_labels']
+            labels = labels[labels != -1]
+            loss = F.cross_entropy(scores, labels, reduction='sum')
+            val_loss += loss.item()
+            # What the masked words predictions were
+            pred = scores.max(dim=-1)[1]
+            n_correct += (pred == labels).sum().item()
+            n_word += labels.numel()
+            actual_words = tokenizer.convert_ids_to_tokens(labels.tolist())
+            pred_words = tokenizer.convert_ids_to_tokens(pred.tolist())
+            assert len(actual_words) == len(pred_words)
+            for actual, pred in zip(actual_words, pred_words):
+                cw.writerow([actual, pred])
+    tot_time = time()-st
+    val_loss /= n_word
+    acc = n_correct / n_word
+    val_log = {'loss': val_loss,
+               'acc': acc,
+               'tok_per_s': n_word/tot_time}
+    LOGGER.info(f"validation finished in {int(tot_time)} seconds, "
+                f"acc: {acc*100:.2f}")
+    return val_log
 
-def random_word(example, vocab_range, mask):
-    """
-    Masking some random prepositional tokens for Language Model task with probabilities as in
-        the original BERT paper.
-    :param tokens: list of int, tokenized sentence.
-    :param vocab_range: for choosing a random word
-    :return: (list of int, list of int), masked tokens and related labels for
-        LM prediction
-    """
-    output_label = []
-    old_tokens = word_tokenize(example['sentence'])    
-    input_ids = []
-    is_subset = False
-    i = 0
-    while i < len(old_tokens):
-        word = old_tokens[i].lower()
-        two, three = None, None
-        if i + 1 < len(old_tokens):
-            two = ' '.join([word, old_tokens[i+1].lower()])
-        if i + 2 < len(old_tokens):
-            three = ' '.join([word, old_tokens[i+1].lower(), old_tokens[i+2].lower()])
-        if word in prepositions:
-            output_label, input_ids = random_replace(1, old_tokens, i, mask, vocab_range, output_label, input_ids)
-            i += 1
-        elif two in prepositions:
-            output_label, input_ids = random_replace(2, old_tokens, i, mask, vocab_range, output_label, input_ids)
-            i += 2
-        elif three in prepositions:
-            output_label, input_ids = random_replace(3, old_tokens, i, mask, vocab_range, output_label, input_ids)
-            i += 3
-        else:
-            wd = tokenizer1.tokenize(word)
-            ids = tokenizer1.convert_tokens_to_ids(wd)
-            output_label.extend([-1]*len(ids))
-            input_ids.extend(ids)
-            i += 1
-    
-    example['input_ids'] = input_ids
-    # print("Mask example['sent']:", example['sentence'])
-    # print("Mask example['input_ids']:", example['input_ids'])
+if __name__ == "__main__":
+    parser = argparse.ArgumentParser()
 
-    if all(o == -1 for o in output_label):
-        # at least mask 1
-        output_label[0] = example['input_ids'][0]
-        input_ids[0] = mask
+    # Required parameters
+    # NOTE: train tasks and val tasks cannot take command line arguments
+    parser.add_argument('--compressed_db', action='store_true',
+                        help='use compressed LMDB')
 
-    # print(f'len(input_ids) is {len(input_ids)}')
-    # print(f'len(output_label) is {len(output_label)}')
-    # input_ids, txt_labels
-    return input_ids, output_label
+    parser.add_argument("--model_config", type=str,
+                        help="path to model structure config json")
+    parser.add_argument("--checkpoint", default=None, type=str,
+                        help="path to model checkpoint (*.pt)")
 
-def random_replace(num_token, token_list, i, mask, vocab_range, output_label, input_ids):
-    for ct in range(i, i + num_token):
-        wd = tokenizer1.tokenize(token_list[ct])
-        tid = tokenizer1.convert_tokens_to_ids(wd)
-        if len(tid) == 1:
-            token_list[ct] = '[MASK]'
-            input_ids.append(mask)
-            output_label.append(tid[0])
-        else:
-            output_label.extend(tid)
-            input_ids.extend(tid)
-    return output_label, input_ids
+    parser.add_argument(
+        "--output_dir", default=None, type=str,
+        help="The output directory where the model checkpoints will be "
+             "written.")
 
-class SpatialMlmDataset(mlm_DetectFeatTxtTokDataset):
-    def __init__(self, txt_db, img_db):
-        assert isinstance(txt_db, TxtTokLmdb)
-        super().__init__(txt_db, img_db)
-        
-    def __getitem__(self, i):
-        """
-        Return:
-        - input_ids    : (L, ), i.e., [cls, wd, wd, ..., sep, 0, 0], 0s padded
-        - img_feat     : (num_bb, d)
-        - img_pos_feat : (num_bb, 7)
-        - attn_masks   : (L + num_bb, ), ie., [1, 1, ..., 0, 0, 1, 1]
-        - txt_labels   : (L, ), [-1, -1, wid, -1, -1, -1]
-        0's padded so that (L + num_bb) % 8 == 0
-        """
-        example = super().__getitem__(i)
+    # Prepro parameters
+    parser.add_argument('--max_txt_len', type=int, default=60,
+                        help='max number of tokens in text (BERT BPE)')
+    parser.add_argument('--conf_th', type=float, default=0.2,
+                        help='threshold for dynamic bounding boxes '
+                             '(-1 for fixed)')
+    parser.add_argument('--max_bb', type=int, default=100,
+                        help='max number of bounding boxes')
+    parser.add_argument('--min_bb', type=int, default=10,
+                        help='min number of bounding boxes')
+    parser.add_argument('--num_bb', type=int, default=36,
+                        help='static number of bounding boxes')
 
-        # text input
-        input_ids, txt_labels = self.create_mlm_io(example)
+    # training parameters
+    parser.add_argument("--train_batch_size", default=4096, type=int,
+                        help="Total batch size for training. "
+                             "(batch by tokens)")
+    parser.add_argument("--val_batch_size", default=4096, type=int,
+                        help="Total batch size for validation. "
+                             "(batch by tokens)")
+    parser.add_argument('--gradient_accumulation_steps', type=int, default=16,
+                        help="Number of updates steps to accumualte before "
+                             "performing a backward/update pass.")
+    parser.add_argument("--learning_rate", default=3e-5, type=float,
+                        help="The initial learning rate for Adam.")
+    parser.add_argument("--valid_steps", default=1000, type=int,
+                        help="Run validation every X steps")
+    parser.add_argument("--num_train_steps", default=100000, type=int,
+                        help="Total number of training updates to perform.")
+    parser.add_argument("--optim", default='adamw',
+                        choices=['adam', 'adamax', 'adamw'],
+                        help="optimizer")
+    parser.add_argument("--betas", default=[0.9, 0.98], nargs='+',
+                        help="beta for adam optimizer")
+    parser.add_argument("--dropout", default=0.1, type=float,
+                        help="tune dropout regularization")
+    parser.add_argument("--weight_decay", default=0.01, type=float,
+                        help="weight decay (L2) regularization")
+    parser.add_argument("--grad_norm", default=2.0, type=float,
+                        help="gradient clipping (-1 for no clipping)")
+    parser.add_argument("--warmup_steps", default=10000, type=int,
+                        help="Number of training steps to perform linear "
+                             "learning rate warmup for.")
 
-        # img input
-        img_feat, img_pos_feat, num_bb = self.mlm_get_img_feat(
-            example['img_fname'])
+    # device parameters
+    parser.add_argument('--seed', type=int, default=42,
+                        help="random seed for initialization")
+    parser.add_argument('--fp16', action='store_true',
+                        help="Whether to use 16-bit float precision instead "
+                             "of 32-bit")
+    parser.add_argument('--n_workers', type=int, default=0,
+                        help="number of data workers")
+    parser.add_argument('--pin_mem', action='store_false', help="pin memory")
 
-        attn_masks = torch.ones(len(input_ids) + num_bb, dtype=torch.long)
-        #attn_masks = torch.ones(len(input_ids), dtype=torch.long)
+    # can use config files
+    parser.add_argument('--config', required=True, help='JSON config files')
 
-        return input_ids.to(device), img_feat.to(device), img_pos_feat.to(device), attn_masks.to(device), txt_labels.to(device)
+    args = parse_with_config(parser)
 
-    def create_mlm_io(self, example):
-        input_ids, txt_labels = mask_spatial(example,
-                                            self.txt_db.v_range,
-                                            self.txt_db.mask)
-        input_ids = torch.tensor([self.txt_db.cls_]
-                                 + input_ids
-                                 + [self.txt_db.sep])
-        txt_labels = torch.tensor([-1] + txt_labels + [-1])
-        return input_ids, txt_labels
-    
-    def mlm_get_img_feat(self, fname_list):
-        img_feats = []
-        img_pos_feats = []
-        num_bb = 0
-        for i, img in enumerate(fname_list):
-            feat, pos, nbb = self._get_img_feat(img)
-            img_feats.append(feat)
-            img_pos_feats.append(pos)
-            num_bb += nbb
-        img_feat = torch.cat(img_feats, dim=0)
-        img_pos_feat = torch.cat(img_pos_feats, dim=0)
-        return img_feat.to(device), img_pos_feat.to(device), num_bb
+    if exists(args.output_dir) and os.listdir(args.output_dir):
+        raise ValueError("Output directory ({}) already exists and is not "
+                         "empty.".format(args.output_dir))
 
-def spatial_mlm_collate(inputs):
-    """
-    Return:
-    :input_ids    (n, max_L) padded with 0
-    :position_ids (n, max_L) padded with 0
-    :txt_lens     list of [txt_len]
-    :img_feat     (n, max_num_bb, feat_dim)
-    :img_pos_feat (n, max_num_bb, 7)
-    :num_bbs      list of [num_bb]
-    :attn_masks   (n, max_{L + num_bb}) padded with 0
-    :txt_labels   (n, max_L) padded with -1
-    """
-    (input_ids, img_feats, img_pos_feats, attn_masks, txt_labels
-     ) = map(list, unzip(inputs))
+    # options safe guard
+    if args.conf_th == -1:
+        assert args.max_bb + args.max_txt_len + 2 <= 512
+    else:
+        assert args.num_bb + args.max_txt_len + 2 <= 512
 
-    # text batches
-    txt_lens = [i.size(0) for i in input_ids]
-    input_ids = pad_sequence(input_ids, batch_first=True, padding_value=0).to(device)
-    txt_labels = pad_sequence(txt_labels, batch_first=True, padding_value=-1).to(device)
-    position_ids = torch.arange(0, input_ids.size(1), dtype=torch.long
-                                ).unsqueeze(0).to(device)
-
-    # image batches
-    num_bbs = [f.size(0) for f in img_feats]
-    img_feat = pad_tensors(img_feats, num_bbs).to(device)
-    img_pos_feat = pad_tensors(img_pos_feats, num_bbs).to(device)
-
-    attn_masks = pad_sequence(attn_masks, batch_first=True, padding_value=0).to(device)
-
-    bs, max_tl = input_ids.size()
-    out_size = attn_masks.size(1)
-    #gather_index = None
-    gather_index = get_gather_index(txt_lens, num_bbs, bs, max_tl, out_size)
-
-
-    batch = {'input_ids': input_ids,
-             'position_ids': position_ids,
-             'img_feat': img_feat,
-             'img_pos_feat': img_pos_feat,
-             'attn_masks': attn_masks,
-              'gather_index': gather_index,
-             'txt_labels': txt_labels}
-    # print(f'batch size is {len(batch["input_ids"])}')
-    return batch
-
-prepositions = [
-        "aboard",
-        "about",
-        "above",
-        "absent",
-        "across",
-        "after",
-        "against",
-        "along",
-        "alongside",
-        "amid",
-        "amidst",
-        "among",
-        "amongst",
-        "around",
-        "as",
-        "astride",
-        "at",
-        "atop",
-        "before",
-        "afore",
-        "behind",
-        "below",
-        "beneath",
-        "beside",
-        "besides",
-        "between",
-        #"beyond",
-        "by",
-        "circa",
-        #"despite",
-        "down",
-        #"during",
-        #"except",
-        "for",
-        "from",
-        "in",
-        "inside",
-        "into",
-        #"less",
-        #"like",
-        #"minus",
-        "near",
-        "nearer",
-        "nearest",
-        #"notwithstanding",
-        #"of",
-        "off",
-        "on",
-        "onto",
-        "opposite",
-        "outside",
-        "over",
-        "past",
-        "per",
-        "save",
-        "since",
-        "through",
-        #"throughout",
-        #"to",
-        "toward",
-        "towards",
-        "under",
-        "underneath",
-        #"until",
-        "up",
-        "upon",
-        "upside",
-        #"versus",
-        #"via",
-        "with",
-        "within",
-        #"without",
-        #"worth",
-        #"according to",
-        "adjacent to",
-        "ahead of",
-        "apart from",
-        #"as of",
-        #"as per",
-        "as regards",
-        "aside from",
-        "astern of",
-        "back to",
-        #"because of",
-        "close to",
-        #"due to",
-        #"except for",
-        "far from",
-        "inside of",
-        #"instead of",
-        "left of",
-        "near to",
-        "next to",
-        "opposite of",
-        "opposite to",
-        "out from",
-        "out of",
-        "outside of",
-        #"owing to",
-        #"prior to",
-        #"pursuant to",
-        #"rather than",
-        #"regardless of",
-        "right of",
-        #"subsequent to",
-        #"such as",
-        #"thanks to",
-        #"up to",
-        #"as far as",
-        #"as opposed to",
-        #"as soon as",
-        #"as well as",
-        #"at the behest of",
-        #"by means of",
-        #"by virtue of",
-        #"for the sake of",
-        #"in accordance with",
-        #"in addition to",
-        #"in case of",
-        "in front of",
-        "in lieu of",
-        #"in place of",
-        "in point of",
-        #"in spite of",
-        #"on account of",
-        #"on behalf of",
-        "on top of",
-        #"with regard to",
-        #"with respect to",
-        "with a view to",
-]
+    main(args)

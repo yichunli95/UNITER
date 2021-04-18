@@ -14,10 +14,13 @@ from .data import (mlm_DetectFeatTxtTokDataset, TxtTokLmdb,
                    pad_tensors, get_gather_index)
 from pytorch_pretrained_bert import BertTokenizer
 from cytoolz import curry
-import nltk
-nltk.download('punkt')
-from nltk.tokenize import word_tokenize
-
+import spacy
+from sprl import * 
+from spacy.tokenizer import Tokenizer
+# import nltk
+# nltk.download('punkt')
+# from nltk.tokenize import word_tokenize
+nlp = spacy.load('/content/UNITER/models/en_core_web_lg-sprl')
 device = torch.device("cuda")
 
 
@@ -34,6 +37,53 @@ def bert_tokenize(tokenizer, text):
 
 tokenizer1 = BertTokenizer.from_pretrained("bert-base-cased", do_lower_case=False)
 tokenizer2 = bert_tokenize(tokenizer1)
+
+def mask_spatial(example, vocab_range, mask):
+    input_ids = []
+    output_label = []
+    # 1. spacy tokenize the sentence and sprl-spacy find the spatial words
+    old_tokens = nlp(example['sentence'])
+    old_tokens = [t.text for t in old_tokens]
+    relations = sprl(example['sentence'], nlp, model_relext_filename='models/model_svm_relations.pkl')
+
+    # 2. replace the spatial tokens with mask only if bert tokenize it as one word
+    mask_to_old_bert_token = {}
+    for rel in relations:
+        start, end = rel[1].start, rel[1].end
+        all_single = True
+        for i in range(start, end):
+            bert_token = tokenizer1.tokenize(old_tokens[i])
+            tid = tokenizer1.convert_tokens_to_ids(bert_token)
+            if len(tid) == 1:
+                mask_to_old_bert_token[i] = tid[0]
+                #old_tokens[i] = '[MASK]'
+            else:
+                all_single = False
+                break
+        if all_single:
+            for i in range(start, end):
+                old_tokens[i] = '[MASK]'
+
+    # 3. use bert to tokenize and generate input_ids and output_label
+    for i, token in enumerate(old_tokens):
+        if token != '[MASK]':
+            wd = tokenizer1.tokenize(token)
+            ids = tokenizer1.convert_tokens_to_ids(wd)
+            output_label.extend([-1]*len(ids))
+            input_ids.extend(ids)
+        else:
+            input_ids.append(mask)
+            output_label.append(mask_to_old_bert_token[i])
+
+    if all(o == -1 for o in output_label):
+        # at least mask 1
+        #output_label[0] = example['input_ids'][0]
+        output_label[0] = tokenizer1.convert_tokens_to_ids(tokenizer1.tokenize('.'))[0]
+        input_ids[0] = mask
+    
+    assert len(input_ids) == len(output_label)
+    return input_ids, output_label
+
 
 def random_word(example, vocab_range, mask):
     """
@@ -71,6 +121,7 @@ def random_word(example, vocab_range, mask):
             output_label.extend([-1]*len(ids))
             input_ids.extend(ids)
             i += 1
+    
     example['input_ids'] = input_ids
     # print("Mask example['sent']:", example['sentence'])
     # print("Mask example['input_ids']:", example['input_ids'])
@@ -127,7 +178,7 @@ class SpatialMlmDataset(mlm_DetectFeatTxtTokDataset):
         return input_ids.to(device), img_feat.to(device), img_pos_feat.to(device), attn_masks.to(device), txt_labels.to(device)
 
     def create_mlm_io(self, example):
-        input_ids, txt_labels = random_word(example,
+        input_ids, txt_labels = mask_spatial(example,
                                             self.txt_db.v_range,
                                             self.txt_db.mask)
         input_ids = torch.tensor([self.txt_db.cls_]

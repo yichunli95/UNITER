@@ -78,7 +78,7 @@ def validate_mlm(model, val_loader, setname):
         cw = csv.writer(f)
         cw.writerow(['actual', 'predict'])
         #print(len(val_loader))
-        for i, batch in enumerate(val_loader):
+        for i, batch in tqdm(enumerate(val_loader)):
 
             scores = model(batch, task='mlm', compute_loss=False)
             # What the masked words originally were

@@ -112,6 +112,10 @@ class UniterForPretraining(UniterPreTrainedModel):
                                       img_feat, img_pos_feat,
                                       attention_mask, gather_index,
                                       output_all_encoded_layers=False)
+        # sequence_output = self.uniter(input_ids, position_ids,
+        #                               None, img_pos_feat,
+        #                               attention_mask, gather_index,
+        #                               output_all_encoded_layers=False)
         # get only the text part
         sequence_output = sequence_output[:, :input_ids.size(1), :]
         # only compute masked tokens for better efficiency

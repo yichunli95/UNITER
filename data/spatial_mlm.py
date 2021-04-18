@@ -173,7 +173,8 @@ class SpatialMlmDataset(mlm_DetectFeatTxtTokDataset):
         img_feat, img_pos_feat, num_bb = self.mlm_get_img_feat(
             example['img_fname'])
 
-        attn_masks = torch.ones(len(input_ids) + num_bb, dtype=torch.long)
+        #attn_masks = torch.ones(len(input_ids) + num_bb, dtype=torch.long)
+        attn_masks = torch.ones(len(input_ids), dtype=torch.long)
 
         return input_ids.to(device), img_feat.to(device), img_pos_feat.to(device), attn_masks.to(device), txt_labels.to(device)
 
@@ -231,15 +232,18 @@ def spatial_mlm_collate(inputs):
 
     bs, max_tl = input_ids.size()
     out_size = attn_masks.size(1)
-    gather_index = get_gather_index(txt_lens, num_bbs, bs, max_tl, out_size)
+    gather_index = None
+    #gather_index = get_gather_index(txt_lens, num_bbs, bs, max_tl, out_size)
+
 
     batch = {'input_ids': input_ids,
              'position_ids': position_ids,
              'img_feat': img_feat,
              'img_pos_feat': img_pos_feat,
              'attn_masks': attn_masks,
-             'gather_index': gather_index,
+              'gather_index': gather_index,
              'txt_labels': txt_labels}
+    # print(f'batch size is {len(batch["input_ids"])}')
     return batch
 
 prepositions = [

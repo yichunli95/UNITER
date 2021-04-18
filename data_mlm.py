@@ -3,7 +3,6 @@ from data import (TokenBucketSampler, TokenBucketSamplerForItm,
                   TxtTokLmdb, ImageLmdbGroup, ConcatDatasetWithLens,
                   SpatialMlmDataset,spatial_mlm_collate)
 from utils.logger import LOGGER, TB_LOGGER, RunningMeter, add_log_to_file
-from horovod import torch as hvd
 from torch.utils.data import DataLoader
 from utils.const import IMG_DIM, IMG_LABEL_DIM, BUCKET_SIZE
 

@@ -29,31 +29,14 @@
     "fp16": true,
     "n_workers": 0,
     "pin_mem": false,
-    "train_datasets": [
-        {
-            "name": "nlvr2",
-            "db": [
-                "nlvr2/txt_db/nlvr2_train.db"
-            ],
-            "img": [
-                "nlvr2/img_db/nlvr2_train"
-            ],
-            "tasks": [
-                "mlm"
-            ],
-            "mix_ratio": [
-                8
-            ]
-        }
-    ],
     "val_datasets": [
         {
             "name": "nlvr2",
             "db": [
-                "nlvr2/txt_db/nlvr2_dev.db"
+                "/content/UNITER/nlvr2/txt_db/nlvr2_dev.db"
             ],
             "img": [
-                "nlvr2/img_db/nlvr2_dev"
+                "/content/UNITER/nlvr2/img_db/nlvr2_dev"
             ],
             "tasks": [
                 "mlm"
@@ -64,10 +47,10 @@
         {
             "name": "nlvr2",
             "db": [
-                "nlvr2/txt_db/nlvr2_test1.db"
+                "/content/UNITER/nlvr2/txt_db/nlvr2_test1.db"
             ],
             "img": [
-                "nlvr2/img_db/nlvr2_test"
+                "/content/UNITER/nlvr2/img_db/nlvr2_test"
             ],
             "tasks": [
                 "mlm"

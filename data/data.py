@@ -13,7 +13,7 @@ from os.path import exists
 import numpy as np
 import torch
 from torch.utils.data import Dataset, ConcatDataset
-import horovod.torch as hvd
+#import horovod.torch as hvd
 from tqdm import tqdm
 import lmdb
 from lz4.frame import compress, decompress
@@ -37,11 +37,12 @@ def compute_num_bb(confs, conf_th, min_bb, max_bb):
 
 
 def _check_distributed():
-    try:
-        dist = hvd.size() != hvd.local_size()
-    except ValueError:
-        # not using horovod
-        dist = False
+    # try:
+    #     dist = hvd.size() != hvd.local_size()
+    # except ValueError:
+    #     # not using horovod
+    #     dist = False
+    dist = False
     return dist
 
 
@@ -219,7 +220,8 @@ def get_ids_and_lens(db):
     assert isinstance(db, TxtTokLmdb)
     lens = []
     ids = []
-    for id_ in list(db.id2len.keys())[hvd.rank()::hvd.size()]:
+    #for id_ in list(db.id2len.keys())[hvd.rank()::hvd.size()]:
+    for id_ in list(db.id2len.keys()):
         lens.append(db.id2len[id_])
         ids.append(id_)
     return lens, ids

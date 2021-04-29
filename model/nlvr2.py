@@ -61,6 +61,55 @@ class UniterForNlvr2Paired(UniterPreTrainedModel):
         else:
             return answer_scores
 
+class UniterForNlvr2PairedSpatialClass(UniterPreTrainedModel):
+    """ Finetune UNITER for NLVR2 (paired format)
+    """
+    def __init__(self, config, img_dim):
+        super().__init__(config)
+        self.uniter = UniterModel(config, img_dim)
+        #self.nlvr2_output = nn.Linear(config.hidden_size*2, 2)
+        self.nlvr2_spatial_class = nn.Linear(config.hidden_size*2, 12) # 11 (spatial classes) + 1 (not spatial)
+        self.apply(self.init_weights)
+
+    def init_type_embedding(self):
+        new_emb = nn.Embedding(3, self.uniter.config.hidden_size)
+        new_emb.apply(self.init_weights)
+        for i in [0, 1]:
+            emb = self.uniter.embeddings.token_type_embeddings\
+                .weight.data[i, :]
+            new_emb.weight.data[i, :].copy_(emb)
+        new_emb.weight.data[2, :].copy_(emb)
+        self.uniter.embeddings.token_type_embeddings = new_emb
+
+    def forward(self, batch, compute_loss=True):
+        batch = defaultdict(lambda: None, batch)
+        input_ids = batch['input_ids']
+        position_ids = batch['position_ids']
+        img_feat = batch['img_feat']
+        img_pos_feat = batch['img_pos_feat']
+        attn_masks = batch['attn_masks']
+        gather_index = batch['gather_index']
+        img_type_ids = batch['img_type_ids']
+        sequence_output = self.uniter(input_ids, position_ids,
+                                      img_feat, img_pos_feat,
+                                      attn_masks, gather_index,
+                                      output_all_encoded_layers=False,
+                                      img_type_ids=img_type_ids)
+        pooled_output = self.uniter.pooler(sequence_output)
+        # concat CLS of the pair
+        n_pair = pooled_output.size(0) // 2
+        reshaped_output = pooled_output.contiguous().view(n_pair, -1)
+        #answer_scores = self.nlvr2_output(reshaped_output)
+        class_scores = self.nlvr2_spatial_class(reshaped_output)
+
+        if compute_loss:
+            targets = batch['targets']
+            nlvr2_loss = F.cross_entropy(
+                class_scores, targets, reduction='none')
+            return nlvr2_loss
+        else:
+            return class_scores
+
 
 class UniterForNlvr2Triplet(UniterPreTrainedModel):
     """ Finetune UNITER for NLVR2 (triplet format)
